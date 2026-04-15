@@ -7,8 +7,9 @@ import os
 import math
 
 # Ruta del archivo ZIP
-zip_path = r'c:\Users\LENOVO\Desktop\Skyline\Automatizaciones\Archivado de fotografias automatico\DJI_001_CACHIMBULO.zip'
-carpeta_salida = r'c:\Users\LENOVO\Desktop\Skyline\Automatizaciones\Archivado de fotografias automatico\Postes'
+zip_path = "Archivado de fotografias automatico/Data/DJI_001_CACHIMBULO.zip"
+carpeta_salida = "Archivado de fotografias automatico/Nodos"
+carpeta_cenitales = "Archivado de fotografias automatico/Cenitales"
 
 def calcular_distancia_gps(lat1, lon1, lat2, lon2):
     """Calcula distancia aproximada entre dos coordenadas GPS en metros"""
@@ -138,9 +139,40 @@ def obtener_metadata_exif(imagen_bytes):
     except Exception as e:
         return None
 
+def es_foto_cenital(img_bytes):
+    """
+    Analiza los bytes de una imagen para determinar si es cenital
+    basándose en el ángulo del Gimbal (GimbalPitchDegree).
+    """
+    etiqueta = b'GimbalPitchDegree="'
+    
+    if etiqueta in img_bytes:
+        # Encontrar la posición del dato
+        idx = img_bytes.find(etiqueta)
+        # Extraer el valor numérico (ej: "-90.00" o "-45.40")
+        inicio = idx + len(etiqueta)
+        fin = img_bytes.find(b'"', inicio)
+        
+        try:
+            valor_texto = img_bytes[inicio:fin].decode('utf-8')
+            angulo = float(valor_texto)
+            
+            # Filtro: Consideramos cenital si está entre -88 y -90 grados
+            # (Damos un margen de 2 grados por posibles vibraciones del dron)
+            if angulo <= -88.0:
+                return True
+        except ValueError:
+            pass
+            
+    return False
+
 # Crear carpeta de salida si no existe
 if not os.path.exists(carpeta_salida):
     os.makedirs(carpeta_salida)
+
+# Crear carpeta cenitales si no existe
+if not os.path.exists(carpeta_cenitales):
+    os.makedirs(carpeta_cenitales)
 
 try:
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -216,9 +248,10 @@ try:
                 if gps:
                     lat = gps['latitud']
                     lon = gps['longitud']
+                    alt = gps['altitud']
                     
                     print(f"Coordenadas: {lat:.6f}° N, {lon:.6f}° W")
-                    print(f"Altitud: {gps['altitud']} m" if gps['altitud'] else "Altitud: No disponible")
+                    print(f"Altitud: {alt} m" if alt else "Altitud: No disponible")
                     
                     # Lógica para agrupar fotos por poste
                     if not poste_actual:
@@ -226,7 +259,8 @@ try:
                         poste_actual = [{
                             'archivo': archivo.filename,
                             'lat': lat,
-                            'lon': lon
+                            'lon': lon,
+                            'alt': alt
                         }]
                         print("✓ Nuevo poste iniciado")
                     else:
@@ -239,7 +273,8 @@ try:
                             poste_actual.append({
                                 'archivo': archivo.filename,
                                 'lat': lat,
-                                'lon': lon
+                                'lon': lon,
+                                'alt': alt
                             })
                             print(f"✓ Agregada al poste actual (distancia: {distancia:.2f} m)")
                         else:
@@ -248,7 +283,8 @@ try:
                             poste_actual = [{
                                 'archivo': archivo.filename,
                                 'lat': lat,
-                                'lon': lon
+                                'lon': lon,
+                                'alt': alt
                             }]
                             print(f"✗ NUEVO POSTE (distancia anterior: {distancia:.2f} m)")
                     
@@ -272,35 +308,83 @@ try:
             carpeta_poste = os.path.join(carpeta_salida, str(numero_real))
             os.makedirs(carpeta_poste, exist_ok=True)
             
+# --- INICIO DEL CICLO MODIFICADO ---
             print(f"\nPoste #{numero_real}:")
-            print(f"  Carpeta: {carpeta_poste}")
-            print(f"  Cantidad de fotos: {len(poste)}")
+            print(f"  Carpeta Nodo: {carpeta_poste}")
+            print(f"  Carpeta Cenital: {os.path.join(carpeta_cenitales, str(numero_real))}")
             
+            conteo_cenitales = 0
             for foto in poste:
-                # Leer archivo desde el ZIP y guardar directamente
+                # Leer bytes de la foto
                 imagen_bytes = zip_ref.read(foto['archivo'])
-                ruta_foto = os.path.join(carpeta_poste, os.path.basename(foto['archivo']))
-                with open(ruta_foto, 'wb') as f:
+                nombre_archivo = os.path.basename(foto['archivo'])
+                
+                # Clasificar según el ángulo del Gimbal
+                if es_foto_cenital(imagen_bytes):
+                    # Definir ruta en carpeta de Cenitales
+                    ruta_dir = os.path.join(carpeta_cenitales, str(numero_real))
+                    os.makedirs(ruta_dir, exist_ok=True)
+                    ruta_final = os.path.join(ruta_dir, nombre_archivo)
+                    label = "[CENITAL]"
+                    conteo_cenitales += 1
+                else:
+                    # Definir ruta en carpeta de Nodo normal
+                    ruta_final = os.path.join(carpeta_poste, nombre_archivo)
+                    label = "[NODO]"
+                
+                # Guardar el archivo en la ubicación decidida
+                with open(ruta_final, 'wb') as f:
                     f.write(imagen_bytes)
-                print(f"    ✓ Guardada: {os.path.basename(foto['archivo'])}")
+                
+                print(f"    ✓ {label} Guardada: {nombre_archivo}")
+
+            if conteo_cenitales == 0:
+                print("    ⚠ Nota: No se detectaron fotos cenitales por ángulo en este poste.")
+            # --- FIN DEL CICLO MODIFICADO ---
         
         # Imprimir resumen por carpeta
         print("\n" + "=" * 80)
         print("RESUMEN DE POSTES IDENTIFICADOS")
         print("=" * 80)
         
+        postes_coordenadas = []  # Guardar coordenadas promedio de cada poste
+        
         for num_poste, poste in enumerate(postes, 1):
             numero_real = num_poste + offset_numeracion
             # Calcular coordenadas promedio
             lat_promedio = sum(foto['lat'] for foto in poste) / len(poste)
             lon_promedio = sum(foto['lon'] for foto in poste) / len(poste)
+            postes_coordenadas.append((lat_promedio, lon_promedio))
             
             print(f"\nPoste #{numero_real}:")
             print(f"  Cantidad de fotos: {len(poste)}")
             print(f"  Ubicación promedio: {lat_promedio:.6f}° N, {lon_promedio:.6f}° W")
+            
+            # Mostrar distancia respecto al poste anterior
+            if num_poste > 1:
+                lat_anterior, lon_anterior = postes_coordenadas[num_poste - 2]
+                distancia_anterior = calcular_distancia_gps(lat_anterior, lon_anterior, lat_promedio, lon_promedio)
+                print(f"  Distancia del poste anterior: {distancia_anterior:.2f} metros")
+            
             print(f"  Google Maps: https://maps.google.com/?q={lat_promedio},{lon_promedio}")
         
         print("\n" + "=" * 80)
+        
+        # Listado de postes con menos de 4 fotos para auditoría
+        print("POSTES CON MENOS DE 4 FOTOS (REQUIEREN AUDITORÍA)")
+        print("=" * 80)
+        
+        postes_auditoria = []
+        for num_poste, poste in enumerate(postes, 1):
+            numero_real = num_poste + offset_numeracion
+            if len(poste) < 4:
+                postes_auditoria.append(numero_real)
+                print(f"Poste #{numero_real}: {len(poste)} fotos")
+        
+        if not postes_auditoria:
+            print("Todos los postes tienen 4 o más fotos.")
+        else:
+            print(f"\nTotal de postes para auditoría: {len(postes_auditoria)}")
             
 except FileNotFoundError:
     print(f"Error: No se encontró el archivo {zip_path}")
