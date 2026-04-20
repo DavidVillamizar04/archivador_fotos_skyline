@@ -7,9 +7,9 @@ import os
 import math
 
 # Ruta del archivo ZIP
-zip_path = "Archivado de fotografias automatico/Data/DJI_001_CACHIMBULO.zip"
-carpeta_salida = "Archivado de fotografias automatico/Nodos"
-carpeta_cenitales = "Archivado de fotografias automatico/Cenitales"
+zip_path = "Data/DJI_001_CACHIMBULO.zip"
+carpeta_salida = "Nodos"
+carpeta_cenitales = "Cenitales"
 
 def calcular_distancia_gps(lat1, lon1, lat2, lon2):
     """Calcula distancia aproximada entre dos coordenadas GPS en metros"""
