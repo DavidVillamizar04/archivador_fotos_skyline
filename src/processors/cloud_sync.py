@@ -46,13 +46,14 @@ def registrar_nodo_critico(zona, poste, cantidad):
 
 def ejecutar_procesamiento_skyline():
     dbx = DropboxConnector()
-    carpeta_entrada = "/2 ENEL CODENSA"
+    carpeta_entrada = "/2 ENEL CODENSA/ZONA 10 (ORIENTE)"
     carpeta_salida = "/CARPETA DE PRUEBAS (NO TOCAR)"
     
     # Parámetros de Triple Confirmación
     umbral_proximidad = 5
     umbral_orientacion = 15
     tolerancia_angulo = 45 
+    distancia_max_nodo = 40 # NUEVO: Límite estricto para pertenecer a un poste
 
     print(f"Conectando a Dropbox para escanear: {carpeta_entrada}...")
     todas_las_imagenes = dbx.listar_archivos_recursivo(carpeta_entrada)
@@ -71,7 +72,6 @@ def ejecutar_procesamiento_skyline():
     rutas_ordenadas = sorted(carpetas_con_fecha.keys(), key=lambda k: carpetas_con_fecha[k])
     
     # --- LÓGICA NUEVA: ESTADO GLOBAL POR SUBZONA ---
-    # Esto evita que el contador se reinicie si el proceso sale y vuelve a una subzona
     estado_subzonas = {} 
 
     for ruta_dir in rutas_ordenadas:
@@ -81,7 +81,7 @@ def ejecutar_procesamiento_skyline():
         # Identificación de Subzona/Circuito
         ruta_rel = os.path.relpath(ruta_dir, carpeta_entrada).replace("\\", "/")
         partes = [p for p in ruta_rel.split('/') if p and p != "."]
-        subzona_id = "/".join(partes[:2]) if len(partes) >= 2 else (partes[0] if partes else "GENERAL")
+        subzona_id = "/".join(partes[:1]) if len(partes) >= 2 else (partes[0] if partes else "GENERAL")
         
         # Inicializar o recuperar estado de la subzona
         if subzona_id not in estado_subzonas:
@@ -111,6 +111,7 @@ def ejecutar_procesamiento_skyline():
                 coords_act = {'latitud': datos['latitud'], 'longitud': datos['longitud']}
                 altitud_act = datos.get('altitud', 0)
                 yaw_act = datos.get('gimbal_yaw', 0)
+                pitch_act = datos.get('pitch', 0) # Recuperamos el pitch para posible promoción
 
                 if datos['es_cenital']:
                     es_mismo = False
@@ -155,9 +156,10 @@ def ejecutar_procesamiento_skyline():
                                 target, metodo = num_act, f"Orientación ({diff_este:.1f}°)"
                             elif est['ultima_cenital_data'] and num_ant:
                                 d_ant = calcular_distancia_metros(f_temp['coords'], est['ultima_cenital_data']['coords'])
-                                if dist_a_este < d_ant:
+                                # MODIFICACIÓN: Aplicación del límite de 40 metros
+                                if dist_a_este < d_ant and dist_a_este <= distancia_max_nodo:
                                     target, metodo = num_act, f"Cercanía Poste Actual ({dist_a_este:.1f}m)"
-                                else:
+                                elif d_ant <= distancia_max_nodo:
                                     target, metodo = num_ant, f"Cercanía Poste Anterior ({d_ant:.1f}m)"
                             
                             if target:
@@ -169,14 +171,54 @@ def ejecutar_procesamiento_skyline():
                         fotos_pendientes = restantes
                         est['ultima_cenital_data'] = {'coords': coords_act, 'altitud': altitud_act}
                 else:
-                    fotos_pendientes.append({'ruta': metadata.path_display, 'nombre': metadata.name, 'coords': coords_act, 'yaw': yaw_act})
+                    # Guardamos también el pitch y la altitud para una posible promoción a cenital
+                    fotos_pendientes.append({
+                        'ruta': metadata.path_display, 
+                        'nombre': metadata.name, 
+                        'coords': coords_act, 
+                        'yaw': yaw_act,
+                        'pitch': pitch_act,
+                        'altitud': altitud_act
+                    })
 
+        # MODIFICACIÓN: Evaluación y Promoción de Clústeres Huérfanos
         if fotos_pendientes:
-            n_fin = est['postes_acumulados'] + est['offset']
-            for f_h in fotos_pendientes:
-                dest_nod = f"{ruta_base}/Nodos/{n_fin}/{f_h['nombre']}"
-                if copiar_con_reintento(dbx, f_h['ruta'], dest_nod):
-                    conteo_fotos[n_fin] = conteo_fotos.get(n_fin, 0) + 1
+            print(f"   🔍 Analizando {len(fotos_pendientes)} fotos huérfanas en busca de nodos perdidos...")
+            while fotos_pendientes:
+                # Tomamos la primera foto huérfana como "semilla" para buscar su clúster
+                seed = fotos_pendientes.pop(0)
+                cluster = [seed]
+                restantes = []
+                
+                for f_h in fotos_pendientes:
+                    # Si está a menos de la distancia máxima de la semilla, es del mismo nodo
+                    if calcular_distancia_metros(seed['coords'], f_h['coords']) <= distancia_max_nodo:
+                        cluster.append(f_h)
+                    else:
+                        restantes.append(f_h)
+                
+                fotos_pendientes = restantes # Las que sobraron se evalúan en el siguiente ciclo
+                
+                # Promover la foto con el pitch más negativo (buscamos el valor más bajo, ej. -78°)
+                promovida = min(cluster, key=lambda x: x['pitch'] if x['pitch'] is not None else 0)
+                
+                est['postes_acumulados'] += 1
+                n_fin = est['postes_acumulados'] + est['offset']
+                conteo_fotos[n_fin] = 1
+                
+                print(f"   🚀 [PROMOCIÓN] Poste #{n_fin} creado desde clúster (Pitch: {promovida['pitch']}°).")
+                dest_cen = f"{ruta_base}/Cenitales/{n_fin}{os.path.splitext(promovida['nombre'])[1]}"
+                copiar_con_reintento(dbx, promovida['ruta'], dest_cen)
+                
+                # Guardar el resto del clúster como nodos de este nuevo poste
+                for f_c in cluster:
+                    if f_c['ruta'] != promovida['ruta']:
+                        dest_nod = f"{ruta_base}/Nodos/{n_fin}/{f_c['nombre']}"
+                        if copiar_con_reintento(dbx, f_c['ruta'], dest_nod):
+                            conteo_fotos[n_fin] = conteo_fotos.get(n_fin, 0) + 1
+                
+                # Actualizar la referencia global para que el siguiente nodo tenga de donde agarrarse
+                est['ultima_cenital_data'] = {'coords': promovida['coords'], 'altitud': promovida['altitud']}
 
         for p_id, cant in conteo_fotos.items():
             if cant < 4: registrar_nodo_critico(subzona_id, p_id, cant)
