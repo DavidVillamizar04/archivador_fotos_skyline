@@ -3,3 +3,7 @@
 /Cenitales
 .env
 */__pycache__/
+*.pyc
+*.pyo
+*.json
+*.log
