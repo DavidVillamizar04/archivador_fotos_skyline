@@ -2,21 +2,23 @@
 cloud_sync.py — Skyline: Procesamiento y clasificación de fotos de infraestructura eléctrica.
 
 Cambios respecto a la versión anterior:
+  - GCP: zona_state.json y nodos_criticos.log migrados a Google Cloud Storage
+    via gcs_client.py. Ya no se escribe nada en disco local.
   - FIX CRÍTICO: La promoción de clústeres ya no fuerza una "cenital falsa". Si ninguna
     foto del clúster alcanza el umbral mínimo de pitch, el nodo se crea sin cenital y
     todas las fotos van a Nodos/. Esto se registra en el log de auditoría.
   - PERFORMANCE: Las descargas de fragmentos se paralelizan con ThreadPoolExecutor,
     reduciendo significativamente el tiempo de espera entre llamadas a la API.
-  - MEMORIA DE ZONA: Se persiste el estado de procesamiento por zona en un archivo JSON
-    local (zona_state.json). Si la última ejecución fue hace más de 2 semanas, se trata
+  - MEMORIA DE ZONA: Se persiste el estado de procesamiento por zona en GCS
+    (zona_state.json). Si la última ejecución fue hace más de 2 semanas, se trata
     como análisis nuevo. Esto permite retomar carpetas nuevas sin reprocessar desde cero.
   - REFACTOR: calcular_rumbo movido a drone_utils.py. No hay duplicación de lógica.
   - LOG DE AUDITORÍA: El log de nodos críticos se separa por ejecución con un timestamp.
+    Se persiste en GCS (nodos_criticos.log).
 """
 
 import sys
 import os
-import math
 import time
 import json
 import datetime
@@ -27,6 +29,11 @@ if ruta_raiz not in sys.path:
     sys.path.append(ruta_raiz)
 
 from src.integrations.dropbox_client import DropboxConnector
+from src.integrations.gcs_client import (
+    cargar_estado_zonas,
+    guardar_estado_zonas,
+    registrar_en_log,
+)
 from src.core.drone_utils import (
     extraer_datos_drone,
     calcular_distancia_metros,
@@ -38,8 +45,8 @@ from src.core.drone_utils import (
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
-CARPETA_ENTRADA = "/2 ENEL CODENSA/ZONA 10 (ORIENTE)"
-CARPETA_SALIDA  = "/CARPETA DE PRUEBAS (NO TOCAR)"
+CARPETA_ENTRADA = os.environ.get("DBX_CARPETA_ENTRADA", "/2 ENEL CODENSA/ZONA 10 (ORIENTE)")
+CARPETA_SALIDA  = os.environ.get("DBX_CARPETA_SALIDA",  "/CARPETA DE PRUEBAS (NO TOCAR)")
 
 UMBRAL_PROXIMIDAD   = 5    # metros — asignación directa sin más comprobaciones
 UMBRAL_ORIENTACION  = 15   # metros — zona donde se verifica el ángulo de la cámara
@@ -48,29 +55,10 @@ DISTANCIA_MAX_NODO  = 40   # metros — límite absoluto para pertenecer a un po
 
 WORKERS_DESCARGA    = 6    # hilos paralelos para descargar fragmentos
 SEMANAS_MEMORIA     = 2    # semanas antes de considerar una zona como análisis nuevo
-ARCHIVO_ESTADO      = "zona_state.json"
-ARCHIVO_LOG         = "nodos_criticos.log"
 
 # ---------------------------------------------------------------------------
-# Estado persistente por zona
+# Estado persistente por zona  (ahora en GCS, no en disco local)
 # ---------------------------------------------------------------------------
-
-def _cargar_estado_zonas():
-    """Lee el JSON de estado guardado en disco. Retorna dict vacío si no existe."""
-    if os.path.exists(ARCHIVO_ESTADO):
-        try:
-            with open(ARCHIVO_ESTADO, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {}
-
-
-def _guardar_estado_zonas(estado):
-    """Persiste el dict de estado en disco."""
-    with open(ARCHIVO_ESTADO, "w", encoding="utf-8") as f:
-        json.dump(estado, f, ensure_ascii=False, indent=2)
-
 
 def _obtener_estado_zona(estado_zonas, subzona_id, dbx, ruta_base_subzona):
     """
@@ -102,7 +90,6 @@ def _obtener_estado_zona(estado_zonas, subzona_id, dbx, ruta_base_subzona):
             "ultimo_archivo_procesado": None,
         }
     else:
-        # Actualizar timestamp en cada ejecución
         estado_zonas[subzona_id]["ultima_ejecucion"] = ahora.isoformat()
 
     return estado_zonas[subzona_id]
@@ -136,12 +123,6 @@ def copiar_con_reintento(dbx_client, ruta_origen, ruta_destino, max_reintentos=5
                 return False
     print(f"      🚫 FALLO DEFINITIVO: {os.path.basename(ruta_destino)}")
     return False
-
-
-def registrar_en_log(linea):
-    """Agrega una línea al log de auditoría con timestamp."""
-    with open(ARCHIVO_LOG, "a", encoding="utf-8") as f:
-        f.write(linea + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +164,6 @@ def descargar_fotos_paralelo(dbx, fotos_metadata):
             except Exception as e:
                 print(f"   [WARN] Error procesando {meta.name}: {e}")
 
-    # Reordenar según el orden original (path_display = orden del vuelo)
     return [resultados[m.path_display] for m in fotos_metadata if m.path_display in resultados]
 
 
@@ -199,18 +179,15 @@ def _clasificar_foto_pendiente(foto, cenital_actual, cenital_anterior, num_act, 
     coords_f = foto["coords"]
     dist_act = calcular_distancia_metros(coords_f, cenital_actual["coords"])
 
-    # Confirmación 1: Proximidad extrema
     if dist_act <= UMBRAL_PROXIMIDAD:
         return num_act, f"Proximidad (<{UMBRAL_PROXIMIDAD}m)"
 
-    # Confirmación 2: Orientación de la cámara
     if dist_act <= UMBRAL_ORIENTACION:
         rumbo = calcular_rumbo(coords_f, cenital_actual["coords"])
         diff = abs((foto["datos"]["gimbal_yaw"] - rumbo + 180) % 360 - 180)
         if diff <= TOLERANCIA_ANGULO:
             return num_act, f"Orientación ({diff:.1f}°)"
 
-    # Confirmación 3: Cercanía geográfica entre postes (con límite de 40 m)
     if cenital_anterior and num_ant is not None:
         d_ant = calcular_distancia_metros(coords_f, cenital_anterior["coords"])
         if dist_act < d_ant and dist_act <= DISTANCIA_MAX_NODO:
@@ -222,7 +199,7 @@ def _clasificar_foto_pendiente(foto, cenital_actual, cenital_anterior, num_act, 
 
 
 # ---------------------------------------------------------------------------
-# Promoción de clústeres huérfanos — FIX CRÍTICO
+# Promoción de clústeres huérfanos
 # ---------------------------------------------------------------------------
 
 def _promover_clusteres(fotos_pendientes, est, ruta_base, subzona_id, carpeta_id, dbx, conteo_fotos):
@@ -230,13 +207,9 @@ def _promover_clusteres(fotos_pendientes, est, ruta_base, subzona_id, carpeta_id
     Agrupa las fotos huérfanas en clústeres y crea un nuevo nodo por cada uno.
 
     FIX CRÍTICO: Si ninguna foto del clúster tiene un pitch suficientemente bajo
-    (>= PITCH_PROMOCION_MIN, ej. -60°), el nodo se crea SIN cenital:
+    (>= PITCH_PROMOCION_MIN), el nodo se crea SIN cenital:
       - Todas las fotos van a Nodos/{n}/
-      - Se registra en el log de auditoría como NODO_SIN_CENITAL para revisión manual.
-    Esto evita que una foto normal (pitch ~0°) sea marcada como cenital.
-
-    carpeta_id: nombre de la subcarpeta de vuelo (ej. "2024-03-15_Vuelo1") para trazabilidad
-    en el log — permite saber exactamente de qué lote de fotos vino el nodo problemático.
+      - Se registra en GCS (nodos_criticos.log) como NODO_SIN_CENITAL.
     """
     while fotos_pendientes:
         seed = fotos_pendientes.pop(0)
@@ -255,14 +228,12 @@ def _promover_clusteres(fotos_pendientes, est, ruta_base, subzona_id, carpeta_id
         n_fin = est["postes_acumulados"] + est["offset"]
         conteo_fotos[n_fin] = 0
 
-        # ── FIX: ¿Hay alguna foto con pitch suficientemente bajo para ser cenital? ──
         candidatas_cenital = [
             f for f in cluster
             if f["datos"]["pitch"] is not None and f["datos"]["pitch"] <= PITCH_PROMOCION_MIN
         ]
 
         if candidatas_cenital:
-            # Promover la que tenga el pitch más negativo dentro del grupo válido
             promovida = min(candidatas_cenital, key=lambda x: x["datos"]["pitch"])
             pitch_promovido = promovida["datos"]["pitch"]
             print(f"   🚀 [PROMOCIÓN] Poste #{n_fin} creado desde clúster (Pitch: {pitch_promovido}°).")
@@ -272,7 +243,6 @@ def _promover_clusteres(fotos_pendientes, est, ruta_base, subzona_id, carpeta_id
             copiar_con_reintento(dbx, promovida["metadata"].path_display, dest_cen, reemplazar=True)
             conteo_fotos[n_fin] += 1
 
-            # Resto del clúster → Nodos
             for f_c in cluster:
                 if f_c["metadata"].path_display != promovida["metadata"].path_display:
                     dest_nod = f"{ruta_base}/Nodos/{n_fin}/{f_c['metadata'].name}"
@@ -285,7 +255,6 @@ def _promover_clusteres(fotos_pendientes, est, ruta_base, subzona_id, carpeta_id
             }
 
         else:
-            # ── NUEVO: Clúster sin ninguna foto con pitch aceptable ──
             print(f"   ⚠️  [SIN CENITAL] Poste #{n_fin}: ninguna foto tiene pitch ≤ {PITCH_PROMOCION_MIN}°. "
                   f"Guardando {len(cluster)} foto(s) solo en Nodos/.")
             registrar_en_log(
@@ -300,8 +269,6 @@ def _promover_clusteres(fotos_pendientes, est, ruta_base, subzona_id, carpeta_id
                 if copiar_con_reintento(dbx, f_c["metadata"].path_display, dest_nod):
                     conteo_fotos[n_fin] += 1
 
-            # Actualizamos la referencia geográfica aunque no haya cenital,
-            # usando la foto con menor pitch disponible como ancla posicional
             mejor_ancla = min(cluster, key=lambda x: x["datos"]["pitch"] if x["datos"]["pitch"] is not None else 0)
             est["ultima_cenital_data"] = {
                 "coords": mejor_ancla["coords"],
@@ -315,37 +282,23 @@ def _promover_clusteres(fotos_pendientes, est, ruta_base, subzona_id, carpeta_id
 
 def _procesar_carpeta(ruta_dir, fotos_metadata, est, estado_zonas, ruta_base, subzona_id, carpeta_id, dbx):
     """
-    Procesa todas las fotos de una carpeta/vuelo:
-    1. Descarga fragmentos en paralelo.
-    2. Si la carpeta estaba en progreso (interrupción previa), salta las fotos
-       ya procesadas y retoma desde la siguiente.
-    3. Aplica Triple Confirmación para clasificar.
-    4. Antes de numerar cada nueva cenital, promueve huérfanos intermedios que
-       geográficamente quedaron entre la cenital anterior y la actual — así los
-       nodos sin cenital reciben un número correlativo en el orden real del vuelo.
-    5. Los huérfanos que queden al final (genuinamente después de la última cenital)
-       se promueven al cierre de la carpeta.
-
-    estado_zonas: referencia al dict completo para poder guardar checkpoints por archivo.
-    carpeta_id: ruta relativa desde CARPETA_ENTRADA, usada en log y en checkpoints.
+    Procesa todas las fotos de una carpeta/vuelo.
+    El checkpoint (guardar_estado_zonas) se llama al terminar cada carpeta completa,
+    no en cada foto, para no saturar GCS con escrituras.
     """
     print(f"\n📂 PROCESANDO CARPETA: {ruta_dir}")
 
-    # ── Descarga paralela ──
     fotos = descargar_fotos_paralelo(dbx, fotos_metadata)
     if not fotos:
         print("   [INFO] No se pudieron descargar fotos con GPS válido.")
         return {}
 
-    # ── Retomar desde interrupción previa ──
-    # Si esta carpeta estaba marcada como "en progreso", saltar los archivos
-    # que ya fueron procesados en la ejecución anterior.
     ultimo_procesado = est.get("ultimo_archivo_procesado")
     if est.get("carpeta_en_progreso") == carpeta_id and ultimo_procesado:
         nombres = [f["metadata"].name for f in fotos]
         if ultimo_procesado in nombres:
             idx = nombres.index(ultimo_procesado)
-            fotos = fotos[idx + 1:]  # Retomar desde el archivo siguiente
+            fotos = fotos[idx + 1:]
             print(f"   ⏩ Retomando desde {ultimo_procesado} — {len(fotos)} foto(s) pendientes.")
         else:
             print(f"   ⚠️  Archivo de retoma '{ultimo_procesado}' no encontrado — reprocesando carpeta completa.")
@@ -360,7 +313,6 @@ def _procesar_carpeta(ruta_dir, fotos_metadata, est, estado_zonas, ruta_base, su
         coords_act = item["coords"]
 
         if datos["es_cenital"]:
-            # ── Verificar si es el mismo poste (cenital duplicada) ──
             es_mismo = False
             if est["ultima_cenital_data"]:
                 dist_cent = calcular_distancia_metros(coords_act, est["ultima_cenital_data"]["coords"])
@@ -384,7 +336,6 @@ def _procesar_carpeta(ruta_dir, fotos_metadata, est, estado_zonas, ruta_base, su
                         conteo_fotos[num_mismo] = conteo_fotos.get(num_mismo, 0) + 1
 
             if not es_mismo:
-                # Guardar referencia al poste anterior ANTES de cualquier promoción
                 cenital_anterior = est["ultima_cenital_data"]
                 est["postes_acumulados"] += 1
                 num_act = est["postes_acumulados"] + est["offset"]
@@ -396,9 +347,6 @@ def _procesar_carpeta(ruta_dir, fotos_metadata, est, estado_zonas, ruta_base, su
                 dest_cen = f"{ruta_base}/Cenitales/{num_act}{ext}"
                 copiar_con_reintento(dbx, metadata.path_display, dest_cen, reemplazar=True)
 
-                # ── Paso 1: Triple Confirmación sobre TODOS los pendientes ──
-                # La Confirmación 3 compara distancia al poste actual vs anterior,
-                # por eso necesitamos cenital_anterior ya definida antes de este bloque.
                 sin_clasificar = []
                 for f_temp in fotos_pendientes:
                     target, metodo = _clasificar_foto_pendiente(
@@ -416,10 +364,6 @@ def _procesar_carpeta(ruta_dir, fotos_metadata, est, estado_zonas, ruta_base, su
                     else:
                         sin_clasificar.append(f_temp)
 
-                # ── Paso 2: De los que NO clasificaron, separar intermedios geográficos ──
-                # Solo se promueven como nodo nuevo los que están más cerca de la cenital
-                # actual que de la anterior — indica un poste sin cenital en medio del recorrido.
-                # Los demás siguen pendientes para la próxima cenital.
                 intermedios = []
                 fotos_pendientes = []
                 for f_h in sin_clasificar:
@@ -433,7 +377,6 @@ def _procesar_carpeta(ruta_dir, fotos_metadata, est, estado_zonas, ruta_base, su
                         else:
                             fotos_pendientes.append(f_h)
                     else:
-                        # Sin cenital anterior de referencia, dejar pendiente
                         fotos_pendientes.append(f_h)
 
                 if intermedios:
@@ -445,14 +388,9 @@ def _procesar_carpeta(ruta_dir, fotos_metadata, est, estado_zonas, ruta_base, su
         else:
             fotos_pendientes.append(item)
 
-        # ── Checkpoint: registrar el último archivo procesado ──
-        # Se guarda después de cada foto para que una interrupción no pierda el progreso.
-        # No se llama a _guardar_estado_zonas() aquí para no saturar disco en cada foto;
-        # el guardado a disco ocurre en el entry point al terminar cada carpeta completa.
         est["carpeta_en_progreso"] = carpeta_id
         est["ultimo_archivo_procesado"] = metadata.name
 
-    # ── Huérfanos genuinos al final (después de la última cenital del vuelo) ──
     if fotos_pendientes:
         print(f"   🔍 {len(fotos_pendientes)} huérfano(s) al final del recorrido — promoviendo...")
         _promover_clusteres(fotos_pendientes, est, ruta_base, subzona_id, carpeta_id, dbx, conteo_fotos)
@@ -473,7 +411,6 @@ def ejecutar_procesamiento_skyline():
         print("No se encontraron imágenes. Verificar ruta de entrada.")
         return
 
-    # Agrupar por carpeta y ordenar carpetas por fecha de modificación
     imagenes_por_carpeta = {}
     carpetas_con_fecha = {}
     for img in todas_las_imagenes:
@@ -485,8 +422,8 @@ def ejecutar_procesamiento_skyline():
 
     rutas_ordenadas = sorted(carpetas_con_fecha, key=lambda k: carpetas_con_fecha[k])
 
-    # Cargar estado persistente
-    estado_zonas = _cargar_estado_zonas()
+    # Cargar estado persistente desde GCS
+    estado_zonas = cargar_estado_zonas()
     ts_inicio = datetime.datetime.utcnow().isoformat()
     registrar_en_log(f"\n{'='*70}\nEJECUCIÓN: {ts_inicio}\n{'='*70}")
 
@@ -494,11 +431,6 @@ def ejecutar_procesamiento_skyline():
         fotos = imagenes_por_carpeta[ruta_dir]
         fotos.sort(key=lambda x: x.client_modified)
 
-        # Determinar subzona/circuito y ruta completa de trazabilidad.
-        # Estructura esperada: ZONA/ciudad/carpeta_vuelo/...
-        # partes[0]  = zona/circuito → subzona_id (clave del estado y del KMZ)
-        # carpeta_id = ruta completa relativa desde CARPETA_ENTRADA, ej:
-        #              "Chipaque/Centro/2024-03-15_Vuelo1"
         ruta_rel = os.path.relpath(ruta_dir, CARPETA_ENTRADA).replace("\\", "/")
         partes = [p for p in ruta_rel.split("/") if p and p != "."]
         subzona_id = partes[0] if len(partes) >= 1 else "GENERAL"
@@ -507,20 +439,17 @@ def ejecutar_procesamiento_skyline():
         ruta_base = f"{CARPETA_SALIDA}/{subzona_id}".replace("//", "/")
         est = _obtener_estado_zona(estado_zonas, subzona_id, dbx, ruta_base)
 
-        # ── Saltar carpetas ya completadas en ejecuciones anteriores ──
         carpetas_procesadas = est.get("carpetas_procesadas", [])
         if carpeta_id in carpetas_procesadas:
             print(f"   ⏭️  Ya procesada, omitiendo: {carpeta_id}")
             continue
 
-        # Marcar como en progreso antes de empezar (por si se interrumpe)
         est["carpeta_en_progreso"] = carpeta_id
         est["ultimo_archivo_procesado"] = None
-        _guardar_estado_zonas(estado_zonas)
+        guardar_estado_zonas(estado_zonas)  # checkpoint antes de empezar
 
         conteo_fotos = _procesar_carpeta(ruta_dir, fotos, est, estado_zonas, ruta_base, subzona_id, carpeta_id, dbx)
 
-        # Auditoría de nodos críticos (menos de 4 fotos incluyendo la cenital)
         for p_id, cant in conteo_fotos.items():
             if cant < 4:
                 registrar_en_log(
@@ -529,12 +458,11 @@ def ejecutar_procesamiento_skyline():
                     f"NODO_CRÍTICO | FOTOS: {cant}"
                 )
 
-        # Carpeta terminada exitosamente: limpiar progreso y registrar como completa
         carpetas_procesadas.append(carpeta_id)
         est["carpetas_procesadas"] = carpetas_procesadas
         est["carpeta_en_progreso"] = None
         est["ultimo_archivo_procesado"] = None
-        _guardar_estado_zonas(estado_zonas)
+        guardar_estado_zonas(estado_zonas)  # checkpoint al terminar carpeta
 
     print("\n" + "=" * 80)
     print("PROCESO FINALIZADO EXITOSAMENTE")

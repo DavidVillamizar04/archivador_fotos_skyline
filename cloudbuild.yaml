@@ -1,0 +1,40 @@
+# cloudbuild.yaml — Pipeline de CI/CD para Cloud Build.
+# Se activa automáticamente en cada push a la rama main.
+# Hace build de la imagen, la sube a Artifact Registry y actualiza el Job.
+
+steps:
+  # 1. Build de la imagen Docker
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:$COMMIT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:latest'
+      - '.'
+
+  # 2. Push a Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}'
+
+  # 3. Actualizar el Cloud Run Job con la nueva imagen
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - update
+      - '${_SERVICE}'
+      - '--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:$COMMIT_SHA'
+      - '--region=${_REGION}'
+
+substitutions:
+  _REGION: us-central1
+  _REPO: skyline           # nombre del repositorio en Artifact Registry
+  _SERVICE: skyline-archivador
+
+options:
+  logging: CLOUD_LOGGING_ONLY
