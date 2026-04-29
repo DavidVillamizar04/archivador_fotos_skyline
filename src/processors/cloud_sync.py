@@ -54,7 +54,7 @@ SUBZONA_FILTRO  = os.environ.get("DBX_SUBZONA_FILTRO", None)
 UMBRAL_PROXIMIDAD   = 5    # metros — asignación directa sin más comprobaciones
 UMBRAL_ORIENTACION  = 15   # metros — zona donde se verifica el ángulo de la cámara
 TOLERANCIA_ANGULO   = 45   # grados — margen de error en el yaw del gimbal
-DISTANCIA_MAX_NODO  = 40   # metros — límite absoluto para pertenecer a un poste
+DISTANCIA_MAX_NODO  = 80   # metros — límite absoluto para pertenecer a un poste
 
 WORKERS_DESCARGA    = 6    # hilos paralelos para descargar fragmentos
 SEMANAS_MEMORIA     = 2    # semanas antes de considerar una zona como análisis nuevo
