@@ -48,6 +48,9 @@ from src.core.drone_utils import (
 CARPETA_ENTRADA = os.environ.get("DBX_CARPETA_ENTRADA", "/2 ENEL CODENSA/ZONA 10 (ORIENTE)")
 CARPETA_SALIDA  = os.environ.get("DBX_CARPETA_SALIDA",  "/CARPETA DE PRUEBAS (NO TOCAR)")
 
+# NUEVO: Variable para hacer pruebas en una subzona específica
+SUBZONA_FILTRO  = os.environ.get("DBX_SUBZONA_FILTRO", None)
+
 UMBRAL_PROXIMIDAD   = 5    # metros — asignación directa sin más comprobaciones
 UMBRAL_ORIENTACION  = 15   # metros — zona donde se verifica el ángulo de la cámara
 TOLERANCIA_ANGULO   = 45   # grados — margen de error en el yaw del gimbal
@@ -435,6 +438,10 @@ def ejecutar_procesamiento_skyline():
         partes = [p for p in ruta_rel.split("/") if p and p != "."]
         subzona_id = partes[0] if len(partes) >= 1 else "GENERAL"
         carpeta_id = ruta_rel if ruta_rel != "." else "GENERAL"
+
+        # NUEVO: Si hay un filtro activo y no coincide con la subzona, la saltamos
+        if SUBZONA_FILTRO and subzona_id != SUBZONA_FILTRO:
+            continue
 
         ruta_base = f"{CARPETA_SALIDA}/{subzona_id}".replace("//", "/")
         est = _obtener_estado_zona(estado_zonas, subzona_id, dbx, ruta_base)
