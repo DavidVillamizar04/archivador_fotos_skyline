@@ -14,6 +14,8 @@ import json
 import datetime
 from google.cloud import storage
 from google.api_core.exceptions import NotFound
+import time
+from google.api_core import exceptions
 
 _GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
 _BLOB_ESTADO = "zona_state.json"
@@ -83,7 +85,10 @@ def registrar_en_log(linea: str) -> None:
         print(f"[GCS][WARN] No se pudo leer {_BLOB_LOG}: {e}")
         contenido_actual = ""
 
-    blob.upload_from_string(
-        contenido_actual + linea + "\n",
-        content_type="text/plain",
-    )
+    for intento in range(3):
+        try:
+            contenido_actual = blob.download_as_text() if blob.exists() else ""
+            blob.upload_from_string(contenido_actual + linea + "\n", content_type="text/plain")
+            break 
+        except exceptions.TooManyRequests:
+            time.sleep(2) # Esperar 2 segundos y reintentar
