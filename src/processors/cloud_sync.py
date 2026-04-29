@@ -434,10 +434,15 @@ def ejecutar_procesamiento_skyline():
         fotos = imagenes_por_carpeta[ruta_dir]
         fotos.sort(key=lambda x: x.client_modified)
 
-        ruta_rel = os.path.relpath(ruta_dir, CARPETA_ENTRADA).replace("\\", "/")
-        partes = [p for p in ruta_rel.split("/") if p and p != "."]
-        subzona_id = partes[0] if len(partes) >= 1 else "GENERAL"
-        carpeta_id = ruta_rel if ruta_rel != "." else "GENERAL"
+        if os.environ.get("MODO_PRUEBA") == "true":
+            subzona_id = os.environ.get("DBX_SUBZONA_FILTRO")
+            # carpeta_id será el nombre de la carpeta del vuelo (ej: "VUELO_1")
+            carpeta_id = os.path.basename(ruta_dir)
+        else:
+            ruta_rel = os.path.relpath(ruta_dir, CARPETA_ENTRADA).replace("\\", "/")
+            partes = [p for p in ruta_rel.split("/") if p and p != "."]
+            subzona_id = partes[0] if len(partes) >= 1 else "GENERAL"
+            carpeta_id = ruta_rel if ruta_rel != "." else "GENERAL"
 
         # NUEVO: Si hay un filtro activo y no coincide con la subzona, la saltamos
         if SUBZONA_FILTRO and subzona_id != SUBZONA_FILTRO:
